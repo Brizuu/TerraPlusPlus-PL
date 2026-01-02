@@ -52,7 +52,7 @@ public final class Terraplusminus extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         LOGGER = this.getLogger();
-        System.setProperty("http.maxConnections", "16");
+        System.setProperty("http.maxConnections", "8");
         System.setProperty("http.keepAlive", "true");
 
         // 2. Wymuś na bibliotece użycie szybkiego cache
