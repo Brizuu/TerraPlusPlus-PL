@@ -1,9 +1,9 @@
 package de.btegermany.terraplusminus.gen;
 
 import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import de.btegermany.terraplusminus.Terraplusminus;
-import de.btegermany.terraplusminus.gen.tree.TreePopulator;
 import de.btegermany.terraplusminus.utils.ConfigurationHelper;
 import lombok.Getter;
 import net.buildtheearth.terraminusminus.generator.CachedChunkData;
@@ -30,7 +30,6 @@ import org.jetbrains.annotations.Nullable;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static java.lang.Math.min;
@@ -42,53 +41,57 @@ import static org.bukkit.block.Biome.*;
 
 public class RealWorldGenerator extends ChunkGenerator {
 
-    @Getter
-    private final EarthGeneratorSettings settings;
-    @Getter
-    private final int yOffset;
+    @Getter private final EarthGeneratorSettings settings;
+    @Getter private final int yOffset;
     private Location spawnLocation = null;
 
-    private final LoadingCache<ChunkPos, CompletableFuture<CachedChunkData>> cache;
-    private final CustomBiomeProvider customBiomeProvider;
+    private final LoadingCache<ChunkPos, CompletableFuture<CachedChunkData>> primaryCache;
+    private final LoadingCache<ChunkPos, CachedChunkData> tickCache;
 
+    private final CustomBiomeProvider customBiomeProvider;
     private final Material surfaceMaterial;
     private final Map<String, Material> materialMapping;
 
     private static final AtomicInteger activeRequests = new AtomicInteger(0);
-    private static final Random randomDelay = new Random();
+    private static final int MAX_CONCURRENT = 12;
+    private static long globalApiLockoutUntil = 0;
 
     private static final Set<Material> GRASS_LIKE_MATERIALS = Set.of(
-            GRASS_BLOCK,
-            DIRT_PATH,
-            FARMLAND,
-            MYCELIUM,
-            SNOW
+            GRASS_BLOCK, DIRT_PATH, FARMLAND, MYCELIUM, SNOW
     );
 
     public RealWorldGenerator(int yOffset) {
+        System.setProperty("sun.net.client.defaultConnectTimeout", "2000");
+        System.setProperty("sun.net.client.defaultReadTimeout", "2000");
         Http.configChanged();
 
         EarthGeneratorSettings settings = EarthGeneratorSettings.parse(EarthGeneratorSettings.BTE_DEFAULT_SETTINGS);
-
         GeographicProjection projection = new OffsetProjectionTransform(
                 settings.projection(),
                 Terraplusminus.config.getInt("terrain_offset.x"),
                 Terraplusminus.config.getInt("terrain_offset.z")
         );
 
-        if (yOffset == 0) {
-            this.yOffset = Terraplusminus.config.getInt("terrain_offset.y");
-        } else {
-            this.yOffset = yOffset;
-        }
-
+        this.yOffset = (yOffset == 0) ? Terraplusminus.config.getInt("terrain_offset.y") : yOffset;
         this.settings = settings.withProjection(projection);
         this.customBiomeProvider = new CustomBiomeProvider(projection);
 
-        this.cache = CacheBuilder.newBuilder()
+        this.primaryCache = CacheBuilder.newBuilder()
                 .expireAfterAccess(5L, TimeUnit.MINUTES)
+                .maximumSize(1000)
                 .softValues()
                 .build(new ChunkDataLoader(this.settings));
+
+        this.tickCache = CacheBuilder.newBuilder()
+                .expireAfterWrite(1, TimeUnit.SECONDS)
+                .maximumSize(512)
+                .build(new CacheLoader<>() {
+                    @Override
+                    public CachedChunkData load(@NotNull ChunkPos pos) {
+                        // TickCache wymusza czekanie (true), bo służy metodom generującym blokowo
+                        return fetchFromPrimary(pos, true);
+                    }
+                });
 
         this.surfaceMaterial = ConfigurationHelper.getMaterial(Terraplusminus.config, "surface_material", GRASS_BLOCK);
         this.materialMapping = Map.of(
@@ -98,130 +101,70 @@ public class RealWorldGenerator extends ChunkGenerator {
         );
     }
 
-    private static long globalApiLockoutUntil = 0;
-
-//    private CachedChunkData getTerraChunkData(int chunkX, int chunkZ) {
-//        long currentTime = System.currentTimeMillis();
-//
-//        if (currentTime < globalApiLockoutUntil) {
-//            return null;
-//        }
-//
-//        try {
-//            if (activeRequests.get() >= 1) {
-//                Thread.sleep(100);
-//            }
-//
-//            activeRequests.incrementAndGet();
-//
-//            CompletableFuture<CachedChunkData> future = this.cache.getUnchecked(new ChunkPos(chunkX, chunkZ));
-//            return future.get(1500, TimeUnit.MILLISECONDS);
-//
-//        } catch (Exception e) {
-//            String fullError = e.toString().toLowerCase();
-//            if (e.getCause() != null) {
-//                fullError += " " + e.getCause().toString().toLowerCase();
-//            }
-//
-//            if (fullError.contains("reset") ||
-//                    fullError.contains("peer") ||
-//                    fullError.contains("429") ||
-//                    fullError.contains("too many")) {
-//
-//                globalApiLockoutUntil = currentTime + 30000;
-//
-//                Terraplusminus.instance.getLogger().severe("--- API BLOCKADE: Connection reset by peer / Rate limit ---");
-//                Terraplusminus.instance.getLogger().severe("API connection rejection detected. Queries blocked for 30 seconds.");
-//            }
-//            else if (fullError.contains("timeout")) {
-//                globalApiLockoutUntil = currentTime + 10000;
-//            }
-//
-//            this.cache.invalidate(new ChunkPos(chunkX, chunkZ));
-//            ChunkStatusCache.markAsFailed(chunkX, chunkZ);
-//            return null;
-//        } finally {
-//            activeRequests.decrementAndGet();
-//        }
-//    }
-
-    private final ThreadLocal<Map<ChunkPos, CachedChunkData>> sessionCache = ThreadLocal.withInitial(HashMap::new);
-
-    private CachedChunkData getTerraChunkData(int chunkX, int chunkZ) {
-        ChunkPos pos = new ChunkPos(chunkX, chunkZ);
-
-        // 1. SESSION CACHE: Błyskawiczny zwrot danych, jeśli już raz o nie pytaliśmy.
-        Map<ChunkPos, CachedChunkData> currentSession = sessionCache.get();
-        if (currentSession.containsKey(pos)) {
-            return currentSession.get(pos);
-        }
-
+    /**
+     * @param block Jeśli true, wątek poczeka na odpowiedź z API (max 2s).
+     * Jeśli false, zwróci dane tylko jeśli są już w pamięci.
+     */
+    private CachedChunkData fetchFromPrimary(ChunkPos pos, boolean block) {
         long currentTime = System.currentTimeMillis();
-
-        // 2. Blokada globalna - jeśli API nas odcięło, nie marnujemy ani milisekundy.
         if (currentTime < globalApiLockoutUntil) return null;
 
-        // 3. Limit aktywnych połączeń (zmniejszony do 3 dla odciążenia oświetlenia)
-        // Twój serwer jest tak przeciążony, że 3 zapytania naraz to max, co udźwignie bez lagów.
-        if (activeRequests.get() >= 3) return null;
-
-        CachedChunkData data = null;
         try {
-            activeRequests.incrementAndGet();
+            CompletableFuture<CachedChunkData> future = this.primaryCache.getIfPresent(pos);
 
-            CompletableFuture<CachedChunkData> future = this.cache.getIfPresent(pos);
             if (future == null) {
-                future = this.cache.getUnchecked(pos);
+                if (activeRequests.get() >= MAX_CONCURRENT) return null;
+                activeRequests.incrementAndGet();
+                future = this.primaryCache.getUnchecked(pos);
+                future.whenComplete((d, ex) -> activeRequests.decrementAndGet());
             }
 
-            // 4. Timeout 3 sekundy.
-            data = future.handle((d, ex) -> {
-                if (ex != null) {
-                    String msg = ex.toString().toLowerCase();
-                    // Jeśli API nas odcina (Connection Refused/Reset/429), blokujemy na 60s.
-                    if (msg.contains("reset") || msg.contains("429") || msg.contains("refused")) {
-                        globalApiLockoutUntil = System.currentTimeMillis() + 60000;
-                    }
-                    return null;
-                }
-                return d;
-            }).get(3000, TimeUnit.MILLISECONDS);
+            if (future.isDone()) {
+                return future.getNow(null);
+            } else if (block) {
+                return future.get(2000, TimeUnit.MILLISECONDS);
+            } else {
+                return null; // Nie blokujemy wątku (np. dla oświetlenia)
+            }
 
         } catch (Exception e) {
-            if (!(e instanceof TimeoutException)) {
-                this.cache.invalidate(pos);
-            }
-        } finally {
-            activeRequests.decrementAndGet();
-
-            // ZAPAMIĘTUJEMY WYNIK (nawet null)
-            currentSession.put(pos, data);
-
-            // Czyścimy sesję po 16 wpisach (rozmiar jednego "regionu" zapytań)
-            if (currentSession.size() > 16) {
-                currentSession.clear();
-            }
+            handleApiError(e);
+            return null;
         }
-        return data;
+    }
+
+    private void handleApiError(Exception e) {
+        String msg = e.toString().toLowerCase();
+        if (e.getCause() != null) msg += " " + e.getCause().toString().toLowerCase();
+
+        if (msg.contains("429") || msg.contains("reset") || msg.contains("refused") || msg.contains("too many")) {
+            globalApiLockoutUntil = System.currentTimeMillis() + 30000;
+            Terraplusminus.instance.getLogger().warning("API Protected - Cooling down for 30s");
+        }
     }
 
     @Override
     public void generateNoise(@NotNull WorldInfo worldInfo, @NotNull Random random, int chunkX, int chunkZ, @NotNull ChunkData chunkData) {
-        CachedChunkData terraData = this.getTerraChunkData(chunkX, chunkZ);
-
-        if (terraData == null) {
-            return;
-        }
+        // Generowanie fizycznego terenu MUSI poczekać na dane (używa TickCache)
+        CachedChunkData terraData = null;
+        try {
+            terraData = tickCache.getUnchecked(new ChunkPos(chunkX, chunkZ));
+        } catch (Exception ignored) {}
 
         int minWorldY = worldInfo.getMinHeight();
         int maxWorldY = worldInfo.getMaxHeight();
 
+        if (terraData == null) {
+            if (this.yOffset > minWorldY) {
+                chunkData.setRegion(0, minWorldY, 0, 16, min(this.yOffset, maxWorldY), 16, STONE);
+            }
+            return;
+        }
+
         int minSurfaceCubeY = blockToCube(minWorldY - this.yOffset);
         int maxWorldCubeY = blockToCube(maxWorldY - this.yOffset);
 
-        if (terraData.aboveSurface(minSurfaceCubeY)) {
-            return;
-        }
+        if (terraData.aboveSurface(minSurfaceCubeY)) return;
 
         while (minSurfaceCubeY < maxWorldCubeY && terraData.belowSurface(minSurfaceCubeY)) {
             minSurfaceCubeY++;
@@ -229,24 +172,31 @@ public class RealWorldGenerator extends ChunkGenerator {
 
         if (minSurfaceCubeY >= maxWorldCubeY) {
             chunkData.setRegion(0, minWorldY, 0, 16, maxWorldY, 16, STONE);
-            return;
         } else {
             chunkData.setRegion(0, minWorldY, 0, 16, cubeToMinBlock(minSurfaceCubeY), 16, STONE);
-        }
-
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                int groundHeight = min(terraData.groundHeight(x, z) + this.yOffset, maxWorldY - 1);
-                int waterHeight = min(terraData.waterHeight(x, z) + this.yOffset, maxWorldY - 1);
-                chunkData.setRegion(x, minWorldY, z, x + 1, groundHeight + 1, z + 1, STONE);
-                chunkData.setRegion(x, groundHeight + 1, z, x + 1, waterHeight + 1, z + 1, WATER);
+            for (int x = 0; x < 16; x++) {
+                for (int z = 0; z < 16; z++) {
+                    int groundHeight = min(terraData.groundHeight(x, z) + this.yOffset, maxWorldY - 1);
+                    int waterHeight = min(terraData.waterHeight(x, z) + this.yOffset, maxWorldY - 1);
+                    if (groundHeight >= minWorldY) {
+                        chunkData.setRegion(x, minWorldY, z, x + 1, groundHeight + 1, z + 1, STONE);
+                    }
+                    if (waterHeight > groundHeight) {
+                        chunkData.setRegion(x, groundHeight + 1, z, x + 1, waterHeight + 1, z + 1, WATER);
+                    }
+                }
             }
         }
     }
 
     @Override
     public void generateSurface(@NotNull WorldInfo worldInfo, @NotNull Random random, int chunkX, int chunkZ, @NotNull ChunkData chunkData) {
-        CachedChunkData terraData = this.getTerraChunkData(chunkX, chunkZ);
+        // Powierzchnia również korzysta z TickCache (blokującego)
+        CachedChunkData terraData = null;
+        try {
+            terraData = tickCache.getUnchecked(new ChunkPos(chunkX, chunkZ));
+        } catch (Exception ignored) {}
+
         if (terraData == null) return;
 
         final int minWorldY = worldInfo.getMinHeight();
@@ -255,29 +205,23 @@ public class RealWorldGenerator extends ChunkGenerator {
         for (int x = 0; x < 16; x++) {
             for (int z = 0; z < 16; z++) {
                 int groundY = terraData.groundHeight(x, z) + this.yOffset;
-                int startMountainHeight = random.nextInt(7500, 7520);
-
                 if (groundY < minWorldY || groundY >= maxWorldY) continue;
 
                 Material material;
                 BlockState state = terraData.surfaceBlock(x, z);
 
                 if (state != null) {
-                    material = this.materialMapping.get(state.getBlock().toString());
-                    if (material == null) {
-                        material = toBukkitBlockData(state).getMaterial();
-                    }
-                } else if (groundY >= startMountainHeight) {
+                    material = this.materialMapping.getOrDefault(state.getBlock().toString(), toBukkitBlockData(state).getMaterial());
+                } else if (groundY >= 7500) {
                     material = STONE;
                 } else {
                     Biome biome = chunkData.getBiome(x, groundY, z);
-                    if (biome == DESERT) material = Material.SAND;
-                    else if (biome == SNOWY_SLOPES || biome == SNOWY_PLAINS || biome == FROZEN_PEAKS) material = SNOW_BLOCK;
+                    if (biome == DESERT) material = SAND;
+                    else if (biome == SNOWY_SLOPES || biome == SNOWY_PLAINS) material = SNOW_BLOCK;
                     else material = this.surfaceMaterial;
                 }
 
-                boolean isUnderWater = groundY + 1 >= maxWorldY || chunkData.getBlockData(x, groundY + 1, z).getMaterial().equals(WATER);
-                if (isUnderWater && GRASS_LIKE_MATERIALS.contains(material)) {
+                if (groundY + 1 < maxWorldY && chunkData.getType(x, groundY + 1, z) == WATER && GRASS_LIKE_MATERIALS.contains(material)) {
                     material = DIRT;
                 }
                 chunkData.setBlock(x, groundY, z, material);
@@ -286,45 +230,23 @@ public class RealWorldGenerator extends ChunkGenerator {
     }
 
     @Override
-    public BiomeProvider getDefaultBiomeProvider(@NotNull WorldInfo worldInfo) {
-        return this.customBiomeProvider;
-    }
-
-    public void generateBedrock(@NotNull WorldInfo worldInfo, @NotNull Random random, int x, int z, @NotNull ChunkGenerator.ChunkData chunkData) {}
-    public void generateCaves(@NotNull WorldInfo worldInfo, @NotNull Random random, int x, int z, @NotNull ChunkGenerator.ChunkData chunkData) {}
-
     public int getBaseHeight(@NotNull WorldInfo worldInfo, @NotNull Random random, int x, int z, @NotNull HeightMap heightMap) {
-        int chunkX = blockToCube(x);
-        int chunkZ = blockToCube(z);
-        x -= cubeToMinBlock(chunkX);
-        z -= cubeToMinBlock(chunkZ);
-        CachedChunkData terraData = this.getTerraChunkData(chunkX, chunkZ);
+        // KLUCZ: oświetlenie pyta o wysokość, ale NIGDY nie czekamy na API (block = false)
+        CachedChunkData data = fetchFromPrimary(new ChunkPos(blockToCube(x), blockToCube(z)), false);
 
-        if (terraData == null) return worldInfo.getMinHeight();
+        if (data == null) return this.yOffset;
 
-        return switch (heightMap) {
-            case OCEAN_FLOOR, OCEAN_FLOOR_WG -> terraData.groundHeight(x, z) + this.yOffset;
-            default -> terraData.surfaceHeight(x, z) + this.yOffset;
-        };
+        int relX = x & 15;
+        int relZ = z & 15;
+        return (heightMap == HeightMap.OCEAN_FLOOR || heightMap == HeightMap.OCEAN_FLOOR_WG)
+                ? data.groundHeight(relX, relZ) + yOffset : data.surfaceHeight(relX, relZ) + yOffset;
     }
 
-    public boolean canSpawn(@NotNull World world, int x, int z) {
-        Block highest = world.getBlockAt(x, world.getHighestBlockYAt(x, z), z);
-        return switch (world.getEnvironment()) {
-            case NETHER -> true;
-            case THE_END -> highest.getType() != Material.AIR && highest.getType() != WATER;
-            default -> highest.getType() == Material.SAND || highest.getType() == Material.GRAVEL;
-        };
-    }
+    @Override public BiomeProvider getDefaultBiomeProvider(@NotNull WorldInfo worldInfo) { return this.customBiomeProvider; }
+    public void generateBedrock(@NotNull WorldInfo worldInfo, @NotNull Random random, int x, int z, @NotNull ChunkData chunkData) {}
+    public void generateCaves(@NotNull WorldInfo worldInfo, @NotNull Random random, int x, int z, @NotNull ChunkData chunkData) {}
 
-    @NotNull
-    @Override
-    public List<BlockPopulator> getDefaultPopulators(@NotNull World world) {
-        return Collections.emptyList();
-    }
-
-    @Nullable
-    public Location getFixedSpawnLocation(@NotNull World world, @NotNull Random random) {
+    @Nullable public Location getFixedSpawnLocation(@NotNull World world, @NotNull Random random) {
         if (spawnLocation == null) spawnLocation = new Location(world, 3517417, 58, -5288234);
         return spawnLocation;
     }
