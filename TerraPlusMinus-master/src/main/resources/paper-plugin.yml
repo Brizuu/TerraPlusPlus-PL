@@ -1,9 +1,9 @@
 name: Terraplusminus
-version: '1.5.3-SNAPSHOT'
+version: '1.5.3'
 main: de.btegermany.terraplusminus.Terraplusminus
 description: A plugin which implements the terra-- api in a spigot plugin
 api-version: '1.21'
 prefix: T+-
-authors: [ meysster, Nudlsupp, Nachwahl, Brizu ]
+authors: [ meysster, Nudlsupp, Nachwahl]
 website: https://bte-germany.de
 load: STARTUP

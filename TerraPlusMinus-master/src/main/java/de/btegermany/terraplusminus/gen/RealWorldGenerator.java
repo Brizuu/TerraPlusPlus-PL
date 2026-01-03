@@ -88,7 +88,6 @@ public class RealWorldGenerator extends ChunkGenerator {
                 .build(new CacheLoader<>() {
                     @Override
                     public CachedChunkData load(@NotNull ChunkPos pos) {
-                        // TickCache wymusza czekanie (true), bo służy metodom generującym blokowo
                         return fetchFromPrimary(pos, true);
                     }
                 });
@@ -101,10 +100,7 @@ public class RealWorldGenerator extends ChunkGenerator {
         );
     }
 
-    /**
-     * @param block Jeśli true, wątek poczeka na odpowiedź z API (max 2s).
-     * Jeśli false, zwróci dane tylko jeśli są już w pamięci.
-     */
+
     private CachedChunkData fetchFromPrimary(ChunkPos pos, boolean block) {
         long currentTime = System.currentTimeMillis();
         if (currentTime < globalApiLockoutUntil) return null;
@@ -124,7 +120,7 @@ public class RealWorldGenerator extends ChunkGenerator {
             } else if (block) {
                 return future.get(2000, TimeUnit.MILLISECONDS);
             } else {
-                return null; // Nie blokujemy wątku (np. dla oświetlenia)
+                return null;
             }
 
         } catch (Exception e) {
@@ -145,7 +141,6 @@ public class RealWorldGenerator extends ChunkGenerator {
 
     @Override
     public void generateNoise(@NotNull WorldInfo worldInfo, @NotNull Random random, int chunkX, int chunkZ, @NotNull ChunkData chunkData) {
-        // Generowanie fizycznego terenu MUSI poczekać na dane (używa TickCache)
         CachedChunkData terraData = null;
         try {
             terraData = tickCache.getUnchecked(new ChunkPos(chunkX, chunkZ));
@@ -191,7 +186,6 @@ public class RealWorldGenerator extends ChunkGenerator {
 
     @Override
     public void generateSurface(@NotNull WorldInfo worldInfo, @NotNull Random random, int chunkX, int chunkZ, @NotNull ChunkData chunkData) {
-        // Powierzchnia również korzysta z TickCache (blokującego)
         CachedChunkData terraData = null;
         try {
             terraData = tickCache.getUnchecked(new ChunkPos(chunkX, chunkZ));
@@ -231,7 +225,6 @@ public class RealWorldGenerator extends ChunkGenerator {
 
     @Override
     public int getBaseHeight(@NotNull WorldInfo worldInfo, @NotNull Random random, int x, int z, @NotNull HeightMap heightMap) {
-        // KLUCZ: oświetlenie pyta o wysokość, ale NIGDY nie czekamy na API (block = false)
         CachedChunkData data = fetchFromPrimary(new ChunkPos(blockToCube(x), blockToCube(z)), false);
 
         if (data == null) return this.yOffset;
